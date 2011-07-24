@@ -14,7 +14,22 @@ typedef struct {
 } ngx_openssl_conf_t;
 
 
+#ifdef RFC_3820_AND_CLASSIC_PROXY_SUPPORT
+#include <openssl/x509v3.h>
+#include <ctype.h>
+#define PROXYCERTINFO_OID      "1.3.6.1.5.5.7.1.14"
+#define OLD_PROXYCERTINFO_OID  "1.3.6.1.4.1.3536.1.222"
+static size_t u_strlen (const unsigned char * s);
+static time_t my_timegm(struct tm *tm);
+static time_t grid_asn1TimeToTimeT(unsigned char *asn1time, size_t len);
+static int grid_X509_verify_callback(int ok, X509_STORE_CTX *ctx);
+static unsigned long grid_X509_knownCriticalExts(X509 *cert);
+static unsigned long grid_verifyProxy(STACK_OF(X509) *certstack);
+static int grid_verifyPathLenConstraints (STACK_OF(X509) * chain);
+static int grid_check_issued_wrapper(X509_STORE_CTX *ctx,X509 *x,X509 *issuer);
+#else
 static int ngx_http_ssl_verify_callback(int ok, X509_STORE_CTX *x509_store);
+#endif /* RFC_3820_AND_CLASSIC_PROXY_SUPPORT */
 static void ngx_ssl_info_callback(const ngx_ssl_conn_t *ssl_conn, int where,
     int ret);
 static void ngx_ssl_handshake_handler(ngx_event_t *ev);
@@ -184,6 +199,8 @@ ngx_ssl_create(ngx_ssl_t *ssl, ngx_uint_t protocols, void *data)
 }
 
 
+
+
 ngx_int_t
 ngx_ssl_certificate(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *cert,
     ngx_str_t *key)
@@ -224,7 +241,26 @@ ngx_ssl_client_certificate(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *cert,
 {
     STACK_OF(X509_NAME)  *list;
 
+#ifndef RFC_3820_AND_CLASSIC_PROXY_SUPPORT
+    /* Classic behaviour */
     SSL_CTX_set_verify(ssl->ctx, SSL_VERIFY_PEER, ngx_http_ssl_verify_callback);
+#else
+    ssl->ctx->cert_store->check_issued = grid_check_issued_wrapper;
+    /* SSL_CTX_set_verify(ssl->ctx, SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT, grid_X509_verify_callback); */
+    SSL_CTX_set_verify(ssl->ctx, SSL_VERIFY_PEER, grid_X509_verify_callback);
+
+    #if OPENSSL_VERSION_NUMBER < 0x00908000L
+    X509_STORE_set_flags(SSL_CTX_get_cert_store(ssl->ctx), X509_V_FLAG_CRL_CHECK |
+            X509_V_FLAG_CRL_CHECK_ALL );
+    #else
+    X509_STORE_set_flags(SSL_CTX_get_cert_store(ssl->ctx), X509_V_FLAG_CRL_CHECK |
+            X509_V_FLAG_CRL_CHECK_ALL |
+            X509_V_FLAG_ALLOW_PROXY_CERTS );
+    #endif /* OPENSSL_VERSION_NUMBER < 0x00908000L */
+    /* Max depth */
+    /* SSL_CTX_set_verify_depth(ctx, MAXCHAINDEPTH) */
+#endif
+
 
     SSL_CTX_set_verify_depth(ssl->ctx, depth);
 
@@ -236,8 +272,14 @@ ngx_ssl_client_certificate(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *cert,
         return NGX_ERROR;
     }
 
+    #ifdef RFC_3820_AND_CLASSIC_PROXY_SUPPORT
+    /* TODO: Clean up this hack and add a proper configuration option for a CA directory */
+    if (SSL_CTX_load_verify_locations(ssl->ctx, (char *) cert->data, "/etc/grid-security/certificates/")
+        == 0)
+    #else
     if (SSL_CTX_load_verify_locations(ssl->ctx, (char *) cert->data, NULL)
         == 0)
+    #endif /* RFC_3820_AND_CLASSIC_PROXY_SUPPORT */
     {
         ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0,
                       "SSL_CTX_load_verify_locations(\"%s\") failed",
@@ -252,6 +294,7 @@ ngx_ssl_client_certificate(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *cert,
                       "SSL_load_client_CA_file(\"%s\") failed", cert->data);
         return NGX_ERROR;
     }
+
 
     /*
      * before 0.9.7h and 0.9.8 SSL_load_client_CA_file()
@@ -311,6 +354,8 @@ ngx_ssl_crl(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *crl)
 }
 
 
+#ifndef RFC_3820_AND_CLASSIC_PROXY_SUPPORT
+/* This function is replaced by: grid_X509_verify_callback */ 
 static int
 ngx_http_ssl_verify_callback(int ok, X509_STORE_CTX *x509_store)
 {
@@ -353,6 +398,7 @@ ngx_http_ssl_verify_callback(int ok, X509_STORE_CTX *x509_store)
 
     return 1;
 }
+#endif /* RFC_3820_AND_CLASSIC_PROXY_SUPPORT */
 
 
 static void
@@ -2105,6 +2151,7 @@ ngx_ssl_get_certificate(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 }
 
 
+/* TODO */
 ngx_int_t
 ngx_ssl_get_subject_dn(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 {
@@ -2147,6 +2194,7 @@ ngx_ssl_get_subject_dn(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 }
 
 
+/* TODO */
 ngx_int_t
 ngx_ssl_get_issuer_dn(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 {
@@ -2319,3 +2367,588 @@ ngx_openssl_exit(ngx_cycle_t *cycle)
     EVP_cleanup();
     ENGINE_cleanup();
 }
+
+
+#ifdef RFC_3820_AND_CLASSIC_PROXY_SUPPORT
+/* ASN1 time string (in a char *) to time_t */
+/**
+ *  (Use ASN1_STRING_data() to convert ASN1_GENERALIZEDTIME to char * if
+ *   necessary)
+ */
+static size_t
+u_strlen (const unsigned char * s) {
+    size_t i;
+    for (i = 0; s[i] != '\0'; i++) ;
+    return i;
+}
+
+/**
+ * Note that timegm() is non-standard. Linux manpage advices the following
+ * substition instead.
+ */
+static time_t
+my_timegm(struct tm *tm)
+{
+    time_t ret;
+    char *tz;
+
+    tz = getenv("TZ");
+    setenv("TZ", "", 1);
+    tzset();
+    ret = mktime(tm);
+    if (tz)
+        setenv("TZ", tz, 1);
+    else
+        unsetenv("TZ");
+    tzset();
+
+    return ret;
+}
+
+static time_t
+grid_asn1TimeToTimeT(unsigned char *asn1time, size_t len) {
+   char   zone;
+   struct tm time_tm;
+
+   if (len == 0) len = u_strlen(asn1time);
+
+   if ((len != 13) && (len != 15)) return 0; /* dont understand */
+
+   if ((len == 13) &&
+       ((sscanf((char *) asn1time, "%02d%02d%02d%02d%02d%02d%c",
+         &(time_tm.tm_year),
+         &(time_tm.tm_mon),
+         &(time_tm.tm_mday),
+         &(time_tm.tm_hour),
+         &(time_tm.tm_min),
+         &(time_tm.tm_sec),
+         &zone) != 7) || (zone != 'Z'))) return 0; /* dont understand */
+
+   if ((len == 15) &&
+       ((sscanf((char *) asn1time, "20%02d%02d%02d%02d%02d%02d%c",
+         &(time_tm.tm_year),
+         &(time_tm.tm_mon),
+         &(time_tm.tm_mday),
+         &(time_tm.tm_hour),
+         &(time_tm.tm_min),
+         &(time_tm.tm_sec),
+         &zone) != 7) || (zone != 'Z'))) return 0; /* dont understand */
+
+   /* time format fixups */
+
+   if (time_tm.tm_year < 90) time_tm.tm_year += 100;
+   --(time_tm.tm_mon);
+
+   return my_timegm(&time_tm);
+}
+
+
+static unsigned long
+grid_X509_knownCriticalExts(X509 *cert) {
+   int  i;
+   char s[80];
+   X509_EXTENSION *ex;
+
+   for (i = 0; i < X509_get_ext_count(cert); ++i) {
+        ex = X509_get_ext(cert, i);
+
+        if (X509_EXTENSION_get_critical(ex) && !X509_supported_extension(ex)) {
+            OBJ_obj2txt(s, sizeof(s), X509_EXTENSION_get_object(ex), 1);
+
+            if (strcmp(s, PROXYCERTINFO_OID) == 0) return X509_V_OK;
+            if (strcmp(s, OLD_PROXYCERTINFO_OID) == 0) return X509_V_OK;
+
+            return X509_V_ERR_UNHANDLED_CRITICAL_EXTENSION;
+          }
+      }
+
+   return X509_V_OK;
+}
+
+/* Check if certificate can be used as a CA to sign standard X509 certs */
+/*
+ *  Return 1 if true; 0 if not.
+ */
+int grid_x509IsCA(X509 *cert)
+{
+    int idret;
+
+    /* final argument to X509_check_purpose() is whether to check for CAness */
+    idret = X509_check_purpose(cert, X509_PURPOSE_SSL_CLIENT, 1);
+    if (idret == 1)
+        return 1;
+    else if (idret == 0)
+        return 0;
+    else {
+        /* Log( L_WARN, "Purpose warning code = %d\n", idret ); */
+        return 1;
+    }
+}
+
+
+/******************************************************************************
+Function:   grid_verifyProxy
+Description:
+    Tries to verify the proxies in the certstack
+******************************************************************************/
+static unsigned long
+grid_verifyProxy( STACK_OF(X509) *certstack ) {
+    /* char    *oper = "Verifying proxy"; */
+
+    int      i = 0;
+    int      serialLen, j = 0;
+    X509    *cert = NULL;
+    time_t   now = time((time_t *)NULL);
+    size_t   len = 0;             /* Lengths of issuer and cert DN */
+    size_t   len2 = 0;            /* Lengths of issuer and cert DN */
+    int      prevIsLimited = 0;   /* previous cert was proxy and limited */
+    char    *cert_DN = NULL;      /* Pointer to current-certificate-in-certstack's DN */
+    char    *issuer_DN = NULL;    /* Pointer to issuer-of-current-cert-in-certstack's DN */
+    char    *proxy_part_DN = NULL;
+    int      depth = sk_X509_num (certstack);
+    int      amount_of_CAs = 0;
+    int      is_old_style_proxy = 0;
+    int      is_limited_proxy = 0;
+    ASN1_INTEGER   *cert_Serial = NULL;
+    ASN1_INTEGER   *issuer_Serial = NULL;
+    unsigned char   serialNumberDER[127];
+    unsigned char   serialStr[255];
+    unsigned char  *temp;
+
+
+    /* And there was (current) time... */
+    time(&now);
+
+    /* How many CA certs are there in the certstack? */
+    for (i = 0; i < depth; i++) {
+        if (grid_x509IsCA(sk_X509_value(certstack, i)))
+            amount_of_CAs++;
+    }
+
+    if ((amount_of_CAs + 2) > depth) {
+        if ((depth - amount_of_CAs) > 0) {
+            /* Log( L_WARN, "No proxy certificate in certificate stack to check." ); */
+            return X509_V_OK;
+        } else {
+            /* Error( oper, "No personal certificate (neither proxy or user certificate) found in the certficiate stack." ); */
+            return X509_V_ERR_APPLICATION_VERIFICATION;
+        }
+    }
+
+    /* Changed this value to start checking the proxy and such and
+       to skip the CA and the user_cert
+    */
+    for (i = depth - (amount_of_CAs + 2); i >= 0; i--) {
+        /* Check for X509 certificate and point to it with 'cert' */
+        if ( (cert = sk_X509_value(certstack, i)) != NULL ) {
+            cert_DN   = X509_NAME_oneline( X509_get_subject_name( cert), NULL, 0);
+            issuer_DN = X509_NAME_oneline( X509_get_issuer_name( cert ), NULL, 0);
+            len       = strlen( cert_DN );
+            len2      = strlen( issuer_DN );
+
+            if (now < grid_asn1TimeToTimeT(ASN1_STRING_data(X509_get_notBefore(cert)),0)) {
+                /* Error( oper, "Proxy certificate is not yet valid." ); */
+                return X509_V_ERR_CERT_NOT_YET_VALID;
+            }
+
+            if (now > grid_asn1TimeToTimeT(ASN1_STRING_data(X509_get_notAfter(cert)),0)) {
+                /* Error( oper, "Proxy certificate expired." ); */
+/* error will be caught later by x509_verify
+                return X509_V_ERR_CERT_HAS_EXPIRED;
+*/
+            }
+
+            /* User not allowed to sign shortened DN */
+            if (len2 > len) {
+                /* Error( oper, "It is not allowed to sign a shorthened DN."); */
+                return X509_V_ERR_APPLICATION_VERIFICATION;
+            }
+
+            /* Proxy subject must begin with issuer. */
+            if (strncmp(cert_DN, issuer_DN, len2) != 0) {
+                /* Error( oper, "Proxy subject must begin with the issuer."); */
+                return X509_V_ERR_APPLICATION_VERIFICATION;
+            }
+
+            /* Set pointer to end of base DN in cert_DN */
+            proxy_part_DN = &cert_DN[len2];
+
+            /* First attempt at support for Old and New style GSI
+               proxies: /CN=anything is ok for now */
+            if (strncmp(proxy_part_DN, "/CN=", 4) != 0) {
+                /* Error( oper, "Could not find a /CN= structure in the DN, thus it is not a proxy."); */
+                return X509_V_ERR_APPLICATION_VERIFICATION;
+            }
+
+            if (strncmp(proxy_part_DN, "/CN=proxy", 9) == 0) {
+                /* Log( L_INFO, "Current certificate is an old style proxy."); */
+                is_old_style_proxy = 1;
+                is_limited_proxy = 0;
+            }
+            else if (strncmp(proxy_part_DN, "/CN=limited proxy", 17) == 0) {
+                /* Log( L_INFO, "Current certificate is an old limited style proxy."); */
+                is_old_style_proxy = 1;
+                is_limited_proxy = 1;
+            } else {
+                /* Log( L_INFO, "Current certificate is a GSI/RFC3820 proxy."); */
+            }
+
+            if ( is_old_style_proxy ) {
+                cert_Serial = X509_get_serialNumber( cert );
+                temp = serialNumberDER;
+                serialLen = i2c_ASN1_INTEGER( cert_Serial, &temp );
+                bzero( serialStr, sizeof( serialStr) );
+                temp = serialStr;
+                for (j = 0; j < serialLen; j++) {
+                    sprintf((char *) temp, "%02X", serialNumberDER[j] );
+                    temp = temp + 2;
+                }
+                /* Log( L_DEBUG, "Serial number: %s", serialStr); */
+
+                issuer_Serial = X509_get_serialNumber( sk_X509_value(certstack, i+1));
+                temp = serialNumberDER;
+                serialLen = i2c_ASN1_INTEGER( issuer_Serial, &temp );
+                bzero( serialStr, sizeof( serialStr) );
+                temp = serialStr;
+                for (j = 0; j < serialLen; j++) {
+                    sprintf((char *) temp, "%02X", serialNumberDER[j] );
+                    temp = temp + 2;
+                }
+                /* Log( L_DEBUG, "Issuer serial number: %s", serialStr); */
+                if (cert_Serial && issuer_Serial) {
+                    if ( ASN1_INTEGER_cmp( cert_Serial, issuer_Serial ) ) {
+                        /* Log( L_WARN, "Serial numbers do not match." ); */
+                    }
+                }
+            }
+
+            if ( is_limited_proxy ) {
+                prevIsLimited = 1;
+                /* if (i > 0) Log( L_WARN, "Found limited proxy."); */
+            } else {
+                if (prevIsLimited) {
+                    /* Error( oper, "Proxy chain integrity error. Previous proxy in chain was limited, but this one is a regular proxy."); */
+                    return X509_V_ERR_APPLICATION_VERIFICATION;
+                }
+            }
+
+            if (cert_DN) free(cert_DN);
+            if (issuer_DN) free(issuer_DN);
+        }
+    }
+
+    return X509_V_OK;
+}
+
+
+
+/******************************************************************************
+Function:   grid_verifyPathLenConstraints
+Description:
+            This function will check the certificate chain on CA based (RFC5280) 
+            and RFC3820 Proxy based Path Length Constraints.
+Parameters:
+    chain of certificates
+Returns:
+    0       : Not ok, failure in the verification or the verification failed
+    1       : Ok, verification has succeeded and positive
+******************************************************************************/
+static int
+grid_verifyPathLenConstraints (STACK_OF(X509) * chain)
+{
+    /* char *oper = "grid_verifyPathLenConstraints"; */
+    X509 * cert = NULL;
+    int i, depth;
+    size_t j;
+    enum {
+          NONE      = 0,
+          CA        = 1,
+          EEC       = 2,
+          GT2_PROXY = 4,
+          RFC_PROXY = 8
+         } curr_cert_type = NONE, expe_cert_type = CA|EEC|RFC_PROXY|GT2_PROXY;
+    char * cert_subjectdn = NULL;
+
+    int ca_path_len_countdown    = -1;
+    int proxy_path_len_countdown = -1;
+
+    /* No chain, no game */
+    if (!chain) {
+        /* Error( oper, "No certificate chain detected."); */
+        goto failure;
+    }
+
+    /* Go through the list, from the CA(s) down through the EEC to the final delegation */
+    depth = sk_X509_num (chain);
+    for (i=depth-1; i >= 0; --i) { 
+        if ((cert = sk_X509_value(chain, i))) {
+            /* Init to None, indicating not to have identified it yet */
+            curr_cert_type = NONE;
+
+            /* Extract Subject DN - Needs free */
+            if (!(cert_subjectdn = X509_NAME_oneline (X509_get_subject_name (cert), NULL, 0))) {
+                /* Error (oper, "Couldn't get the subject DN from the certificate at depth %d\n"); */
+                goto failure;
+            }
+
+            /* Log (L_DEBUG, "\tCert here is: %s\n", cert_subjectdn); */
+
+            /* Is it a CA certificate */
+            if (grid_x509IsCA(cert)) {
+                curr_cert_type = CA;
+            } else {
+#if OPENSSL_VERSION_NUMBER < 0x00908000L
+                /* Is the certificate an RFC 3820 proxy? */
+                if (cert->ex_flags & EXFLAG_PROXY) {
+                    curr_cert_type = RFC_PROXY;
+                } else {
+#endif
+                    /* Is the certificate an old style / classic proxy? */
+
+                    /* Lower case the Subject DN */
+                    for (j = 0; j < strlen(cert_subjectdn); j++) {
+                        cert_subjectdn[j] = tolower(cert_subjectdn[j]);
+                    }
+
+                    /* Does the subject DN have the old style proxy certifcate signature /cn=proxy substring? */
+                    if (strstr(cert_subjectdn, "/cn=proxy")) {
+                        curr_cert_type = GT2_PROXY;
+                    } else {
+                        /* If all else fails, it's an EEC certificate */
+                        curr_cert_type = EEC;
+                    }
+#if OPENSSL_VERSION_NUMBER < 0x00908000L
+                }
+#endif
+            }
+
+
+            /* Expectation management */
+            if (!((expe_cert_type & curr_cert_type) == curr_cert_type)) {
+                /* Failed to comply with the expectations! */
+/*
+                if (expe_cert_type == CA)
+                    Error(oper, "Certificate chain not build in the right order. Got a %s certificate, but expected a CA certificate at depth %d of %d\n",
+                                curr_cert_type == CA ? "CA" : curr_cert_type == EEC ? "EEC" : curr_cert_type == GT2_PROXY ? "old-style Proxy" : curr_cert_type == RFC_PROXY ? "RFC3820 Proxy" : "Unknown", i, depth);
+                if (expe_cert_type == EEC)
+                    Error(oper, "Certificate chain not build in the right order. Got a %s certificate, but expected a EEC certificate at depth %d of %d\n",
+                                curr_cert_type == CA ? "CA" : curr_cert_type == EEC ? "EEC" : curr_cert_type == GT2_PROXY ? "old-style Proxy" : curr_cert_type == RFC_PROXY ? "RFC3820 Proxy" : "Unknown", i, depth);
+                if (expe_cert_type == GT2_PROXY)
+                    Error(oper, "Certificate chain not build in the right order. Got a %s certificate, but expected an old-style Proxy certificate at depth %d of %d\n",
+                                curr_cert_type == CA ? "CA" : curr_cert_type == EEC ? "EEC" : curr_cert_type == GT2_PROXY ? "old-style Proxy" : curr_cert_type == RFC_PROXY ? "RFC3820 Proxy" : "Unknown", i, depth);
+                if (expe_cert_type == RFC_PROXY)
+                    Error(oper, "Certificate chain not build in the right order. Got a %s certificate, but expected an RFC3820 Proxy certificate at depth %d of %d\n",
+                                curr_cert_type == CA ? "CA" : curr_cert_type == EEC ? "EEC" : curr_cert_type == GT2_PROXY ? "old-style Proxy" : curr_cert_type == RFC_PROXY ? "RFC3820 Proxy" : "Unknown", i, depth);
+                if (expe_cert_type & (RFC_PROXY | GT2_PROXY))
+                    Error(oper, "Certificate chain not build in the right order. Got a %s certificate, but expected an RFC3820 Proxy or old-style Proxy certificate at depth %d of %d\n",
+                                curr_cert_type == CA ? "CA" : curr_cert_type == EEC ? "EEC" : curr_cert_type == GT2_PROXY ? "old-style Proxy" : curr_cert_type == RFC_PROXY ? "RFC3820 Proxy" : "Unknown", i, depth);
+                if (expe_cert_type & (CA | EEC))
+                    Error(oper, "Certificate chain not build in the right order. Got a %s certificate, but expected a CA or EEC certificate at depth %d of %d\n",
+                                curr_cert_type == CA ? "CA" : curr_cert_type == EEC ? "EEC" : curr_cert_type == GT2_PROXY ? "old-style Proxy" : curr_cert_type == RFC_PROXY ? "RFC3820 Proxy" : "Unknown", i, depth);
+*/
+                goto failure;
+            }
+
+            if (curr_cert_type == CA) {
+                /* Expected next certificate type is: CA or EEC certificate */
+                expe_cert_type = CA|EEC;
+
+                /* Exceeded CA Path Length ? */
+                if (ca_path_len_countdown == 0) {
+                    /* Error(oper, "CA Path Length Constraint exceeded on depth %d for certificate \"%s\". No CA certifcates were expected at this stage.\n", i, cert_subjectdn); */
+                    goto failure;
+                }
+
+                /* Store pathlen, override when small, otherwise keep the smallest */
+                if (cert->ex_pathlen != -1) {
+                    /* Update when ca_path_len_countdown is the initial value
+                     * or when the PathLenConstraint is smaller then the
+                     * remembered ca_path_len_countdown */
+                    if ((ca_path_len_countdown == -1) || (cert->ex_pathlen < ca_path_len_countdown)) {
+                        ca_path_len_countdown = cert->ex_pathlen;
+                    } else {
+                        /* If a path length was already issuesd, lower ca_path_len_countdown */
+                        if (ca_path_len_countdown != -1)
+                            ca_path_len_countdown--;
+                    }
+                } else {
+                    /* If a path length was already issuesd, lower ca_path_len_countdown */
+                    if (ca_path_len_countdown != -1)
+                        ca_path_len_countdown--;
+                }
+
+            } else if (curr_cert_type == EEC) {
+                /* Expected next certificate type is: GT2_PROXY or RFC_PROXY certificate */
+                expe_cert_type = GT2_PROXY|RFC_PROXY;
+
+            } else if (curr_cert_type == GT2_PROXY) {
+                /* Expected next certificate type is: GT2_PROXY certificate */
+                expe_cert_type = GT2_PROXY;
+
+            } else if (curr_cert_type == RFC_PROXY) {
+                /* Expected next certificate type is: RFC_PROXY certificate */
+                expe_cert_type = RFC_PROXY;
+
+                /* Exceeded CA Path Length ? */
+                if (proxy_path_len_countdown == 0) {
+                    /* Error(oper, "Proxy Path Length Constraint exceeded on depth %d of %d for certificate \"%s\". No Proxy certifcates were expected at this stage.\n", i, depth, cert_subjectdn); */
+                    goto failure;
+                }
+
+                /* Store pathlen, override when small, otherwise keep the smallest */
+                if (cert->ex_pcpathlen != -1) {
+                    /* Update when proxy_path_len_countdown is the initial value
+                     * or when the PathLenConstraint is smaller then the
+                     * remembered proxy_path_len_countdown */
+
+                    if ((proxy_path_len_countdown == -1) || (cert->ex_pcpathlen < proxy_path_len_countdown)) {
+                        proxy_path_len_countdown = cert->ex_pcpathlen;
+                        /* Log (L_DEBUG, "\tCert here is: %s -> Setting proxy path len constraint to: %d\n", cert_subjectdn, cert->ex_pcpathlen); */
+                    } else {
+                        /* If a path length was already issuesd, lower ca_path_len_countdown */
+                        if (proxy_path_len_countdown != -1)
+                            proxy_path_len_countdown--;
+
+                        /* Log (L_DEBUG, "\tCert here is: %s -> Countdown is at %d\n", cert_subjectdn, proxy_path_len_countdown); */
+                    }
+                } else {
+                    /* If a path length was already issuesd, lower ca_path_len_countdown */
+                    if (proxy_path_len_countdown != -1)
+                        proxy_path_len_countdown--;
+
+                    /* Log (L_DEBUG, "\tCert here is: %s -> Countdown is at %d\n", cert_subjectdn, proxy_path_len_countdown); */
+                }
+            }
+
+            /* Free memory during each cycle */
+            if (cert_subjectdn)
+                free(cert_subjectdn);
+        }
+    }
+/* success: */
+    /* Return an OK (thumbs up) in the grid_X509_verify_callback() */
+    return 1;
+
+failure:
+    if (cert_subjectdn)
+        free(cert_subjectdn);
+    return 0;
+}
+
+
+/******************************************************************************
+Function:   verify_callback
+Description:
+    Callback function for OpenSSL to put the errors
+Parameters:
+    ok, X509_STORE_CTX
+Returns:
+******************************************************************************/
+static int
+grid_X509_verify_callback(int ok, X509_STORE_CTX *ctx)
+{
+    unsigned long   errnum   = X509_STORE_CTX_get_error(ctx);
+    int             errdepth = X509_STORE_CTX_get_error_depth(ctx);
+    STACK_OF(X509) *certstack;
+
+    FILE * f = fopen("/tmp/nginx.log", "a");;
+    fprintf (f, "%s / depth: %d, error depth: %d, error code: %d\n", __func__, sk_X509_num (X509_STORE_CTX_get_chain(ctx)), errdepth, (int)errnum);
+    fflush(f);
+
+    fprintf (f, "%s / subject DN here is: %s\n", __func__, X509_NAME_oneline(X509_get_subject_name(X509_STORE_CTX_get_current_cert(ctx)), NULL, 0));
+    fflush(f);
+
+    /* When not ok... */
+    if (ok != 1) {
+        if (errnum == X509_V_ERR_INVALID_CA) ok=1;
+        if (errnum == X509_V_ERR_UNABLE_TO_GET_CRL) ok=1;
+#if OPENSSL_VERSION_NUMBER >= 0x00908000L
+        /* I don't want to do this, really, but I have yet to figure out
+           how to get openssl 0.9.8 to accept old-style proxy certificates...
+        */
+        if (errnum == X509_V_ERR_INVALID_PURPOSE) ok=1;
+#endif
+        if (errnum == X509_V_ERR_UNHANDLED_CRITICAL_EXTENSION) {
+            errnum = grid_X509_knownCriticalExts(X509_STORE_CTX_get_current_cert(ctx));
+            ctx->error = errnum;
+            if (errnum == X509_V_OK) ok=1;
+        }
+
+        /* Path length exceeded for the CA (should never happen in OpenSSL - famous last words) */
+        if (ctx->error == X509_V_ERR_PATH_LENGTH_EXCEEDED) {
+            /* Log( L_DEBUG, "Shallow Error X509_V_ERR_PATH_LENGTH_EXCEEDED: Running alternative RFC5280 and RFC3820 compliance tests.\n"); */
+            ok = grid_verifyPathLenConstraints(X509_STORE_CTX_get_chain(ctx));
+            /* Log( L_DEBUG, "Alternative RFC5280 and RFC3820 compliance tests result is: \"%s\".\n", ok == 1 ? "OK" : "Not OK"); */
+        }
+
+        /* Path length exceeded for the Proxy! -> Override and continue */
+        /* This is NOT about X509_V_ERR_PATH_LENGTH_EXCEEDED */
+#if OPENSSL_VERSION_NUMBER < 0x00908000L
+        if (ctx->error == X509_V_ERR_PROXY_PATH_LENGTH_EXCEEDED) {
+            /* Log( L_DEBUG, "Shallow Error X509_V_ERR_PROXY_PATH_LENGTH_EXCEEDED: Running alternative RFC5280 and RFC3820 compliance tests.\n"); */
+            ok = grid_verifyPathLenConstraints(X509_STORE_CTX_get_chain(ctx));
+            /* Log( L_DEBUG, "Alternative RFC5280 and RFC3820 compliance tests result is: \"%s\".\n", ok == 1 ? "OK" : "Not OK"); */
+        }
+#endif
+    }
+
+    /*
+     * We've now got the last certificate - the identity being used for
+     * this connection. At this point we check the whole chain for valid
+     * CAs or, failing that, GSI-proxy validity using grid_verifyProxy
+     */
+    if ( (errdepth == 0) && (ok == 1) ) {
+        certstack = (STACK_OF(X509) *) X509_STORE_CTX_get_chain( ctx );
+
+        errnum = grid_verifyProxy( certstack );
+
+/*
+        Log( L_DEBUG, "grid_verify_callback: verifyProxy returned with error code %d: %s", 
+                        errnum,
+                        X509_verify_cert_error_string (errnum));
+*/
+
+        ctx->error = errnum;
+        ok = (errnum == X509_V_OK);
+    }
+
+    /* Error condition is unrecoverable */
+    if (ok != 1) {
+        fprintf (f, "%s / Still not positivielty verified!\n", __func__);
+        /* Log( L_INFO, "grid_verify_callback: error code: %d, message: \"%s\"", ctx->error, X509_verify_cert_error_string (ctx->error)); */
+    }
+
+    return ok;
+}
+
+
+/*
+ * We change the default callback to use our wrapper and discard errors
+ *  due to GSI proxy chains (ie where users certs act as CAs)
+ */
+static int grid_check_issued_wrapper(X509_STORE_CTX *ctx,X509 *x,X509 *issuer) {
+    int ret = 0;
+
+    /* If all is ok, move out of here */
+    if ((ret = X509_check_issued(issuer, x)) == X509_V_OK)
+        return 1;
+
+    /* Non self-signed certs without signing are ok if they passed
+           the other checks inside X509_check_issued. Is this enough? */
+    if ((ret == X509_V_ERR_KEYUSAGE_NO_CERTSIGN) &&
+        (X509_subject_name_cmp(issuer, x) != 0)) return 1;
+
+    /* If we haven't asked for issuer errors don't set ctx */
+#if OPENSSL_VERSION_NUMBER < 0x00908000L
+    if (!(ctx->flags & X509_V_FLAG_CB_ISSUER_CHECK)) return 0;
+#else
+    if (!(ctx->param->flags & X509_V_FLAG_CB_ISSUER_CHECK)) return 0;
+#endif
+
+    ctx->error = ret;
+    ctx->current_cert = x;
+    ctx->current_issuer = issuer;
+
+    return ctx->verify_cb(0, ctx);
+}
+#endif /* RFC_3820_AND_CLASSIC_PROXY_SUPPORT */
