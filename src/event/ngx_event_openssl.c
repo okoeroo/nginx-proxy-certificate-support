@@ -248,7 +248,7 @@ ngx_ssl_client_certificate(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *cert,
     SSL_CTX_set_verify_depth(ssl->ctx, depth);
 #else
     ssl->ctx->cert_store->check_issued = grid_check_issued_wrapper;
-    SSL_CTX_set_verify(ssl->ctx, SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT, grid_X509_verify_callback);
+    SSL_CTX_set_verify(ssl->ctx, SSL_VERIFY_PEER, grid_X509_verify_callback);
     /* SSL_CTX_set_verify(ssl->ctx, SSL_VERIFY_PEER, grid_X509_verify_callback); */
 
     #if OPENSSL_VERSION_NUMBER < 0x00908000L
