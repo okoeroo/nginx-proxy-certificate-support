@@ -239,15 +239,17 @@ ngx_int_t
 ngx_ssl_client_certificate(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *cert,
     ngx_int_t depth)
 {
+#ifndef RFC_3820_AND_CLASSIC_PROXY_SUPPORT
     STACK_OF(X509_NAME)  *list;
 
-#ifndef RFC_3820_AND_CLASSIC_PROXY_SUPPORT
     /* Classic behaviour */
     SSL_CTX_set_verify(ssl->ctx, SSL_VERIFY_PEER, ngx_http_ssl_verify_callback);
+
+    SSL_CTX_set_verify_depth(ssl->ctx, depth);
 #else
     ssl->ctx->cert_store->check_issued = grid_check_issued_wrapper;
-    /* SSL_CTX_set_verify(ssl->ctx, SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT, grid_X509_verify_callback); */
-    SSL_CTX_set_verify(ssl->ctx, SSL_VERIFY_PEER, grid_X509_verify_callback);
+    SSL_CTX_set_verify(ssl->ctx, SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT, grid_X509_verify_callback);
+    /* SSL_CTX_set_verify(ssl->ctx, SSL_VERIFY_PEER, grid_X509_verify_callback); */
 
     #if OPENSSL_VERSION_NUMBER < 0x00908000L
     X509_STORE_set_flags(SSL_CTX_get_cert_store(ssl->ctx), X509_V_FLAG_CRL_CHECK |
@@ -257,12 +259,10 @@ ngx_ssl_client_certificate(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *cert,
             X509_V_FLAG_CRL_CHECK_ALL |
             X509_V_FLAG_ALLOW_PROXY_CERTS );
     #endif /* OPENSSL_VERSION_NUMBER < 0x00908000L */
-    /* Max depth */
-    /* SSL_CTX_set_verify_depth(ctx, MAXCHAINDEPTH) */
+
+    SSL_CTX_set_verify_depth(ssl->ctx, 99);
 #endif
 
-
-    SSL_CTX_set_verify_depth(ssl->ctx, depth);
 
     if (cert->len == 0) {
         return NGX_OK;
@@ -287,7 +287,10 @@ ngx_ssl_client_certificate(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *cert,
         return NGX_ERROR;
     }
 
+    /* Why is this needed */
+    #ifndef RFC_3820_AND_CLASSIC_PROXY_SUPPORT
     list = SSL_load_client_CA_file((char *) cert->data);
+
 
     if (list == NULL) {
         ngx_ssl_error(NGX_LOG_EMERG, ssl->log, 0,
@@ -304,6 +307,7 @@ ngx_ssl_client_certificate(ngx_conf_t *cf, ngx_ssl_t *ssl, ngx_str_t *cert,
     ERR_clear_error();
 
     SSL_CTX_set_client_CA_list(ssl->ctx, list);
+    #endif
 
     return NGX_OK;
 }
@@ -2858,8 +2862,21 @@ grid_X509_verify_callback(int ok, X509_STORE_CTX *ctx)
     fprintf (f, "%s / subject DN here is: %s\n", __func__, X509_NAME_oneline(X509_get_subject_name(X509_STORE_CTX_get_current_cert(ctx)), NULL, 0));
     fflush(f);
 
+    certstack = (STACK_OF(X509) *) X509_STORE_CTX_get_chain( ctx );
+    int i;
+    for (i=0; i< sk_X509_num (certstack); i++) {
+        if (grid_x509IsCA(sk_X509_value(certstack, i)))
+            fprintf (f, "%s / subject DN of CA         : %s\n", __func__, X509_NAME_oneline(X509_get_subject_name(sk_X509_value(certstack, i)), NULL, 0));
+        else
+            fprintf (f, "%s / subject DN of certificate: %s\n", __func__, X509_NAME_oneline(X509_get_subject_name(sk_X509_value(certstack, i)), NULL, 0));
+        fflush(f);
+    }
+
     /* When not ok... */
     if (ok != 1) {
+        /* TODO: DEBUG due to my bad personal test CA  */
+        if (errnum == X509_V_FLAG_X509_STRICT) ok=1;
+        /* See ^ */
         if (errnum == X509_V_ERR_INVALID_CA) ok=1;
         if (errnum == X509_V_ERR_UNABLE_TO_GET_CRL) ok=1;
 #if OPENSSL_VERSION_NUMBER >= 0x00908000L

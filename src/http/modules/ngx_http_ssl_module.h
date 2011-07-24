@@ -34,6 +34,7 @@ typedef struct {
     ngx_str_t                       dhparam;
     ngx_str_t                       client_certificate;
     ngx_str_t                       crl;
+    ngx_str_t                       ca_directory;
 
     ngx_str_t                       ciphers;
 
